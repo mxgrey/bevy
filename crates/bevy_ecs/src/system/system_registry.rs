@@ -106,7 +106,8 @@ pub enum SystemRemoval {
     /// If the system was available immediately then it will be held here.
     Immediate(BoxedSystem),
     /// If the system is not immediately available because it is currently being
-    /// called, then this lets the user
+    /// called, then this lets the user provide a callback system that will be
+    /// called later to receive the removed system.
     Deferred(Arc<Mutex<Option<BoxedSystem<BoxedSystem>>>>),
 }
 
