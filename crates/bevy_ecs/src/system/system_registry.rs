@@ -5,6 +5,7 @@ use crate::world::{Mut, World};
 // Needed for derive(Component) macro
 use crate::{self as bevy_ecs};
 use bevy_ecs_macros::Resource;
+use std::sync::{Arc, Mutex};
 
 /// Stores systems, so they can be reused and run in an ad-hoc fashion.
 ///
@@ -75,14 +76,65 @@ pub struct SystemRegistry {
     systems: HashMap<u32, RegisteredSystem>,
 }
 
-/// A small wrapper for [`BoxedSystem`] that also keeps track whether or not the system has been initialized.
+/// A wrapper for [`BoxedSystem`] that keeps track of whether or not the system
+/// has been initialized and gracefully handles recursive calling.
 ///
 /// The [`SystemRegistry`] stores systems in this format.
-pub struct RegisteredSystem {
+struct RegisteredSystem {
     /// Shows whether or not the system is initialized.
-    pub initialized: bool,
+    initialized: bool,
     /// The system stored in the [`SystemRegistry`].
-    pub system: BoxedSystem,
+    system: Option<BoxedSystem>,
+    /// The number of calls to this system which were triggered recursively.
+    /// We will continue to call the function while this number is greater than
+    /// 0.
+    recursive_calls: usize,
+    /// If the user asked for the system to be removed while it was being called
+    /// recursively, then the outer Option will be None. If the user provided a
+    /// system to handle the removal once the recursion is finished, then the
+    /// inner Option will be Some.
+    removed: Option<Arc<Mutex<Option<BoxedSystem<BoxedSystem>>>>>,
+}
+
+/// Receive a system that has been removed from the registry. In most cases you
+/// will get the `Immediate` result which means you can access the system right
+/// away. However if you are attempting to remove a system which is presently
+/// being run (recursively) then you will get the `Deferred` result which gives
+/// you an opportunity to provide a system to receive the removed system once it
+/// is available to be taken.
+pub enum SystemRemoval {
+    /// If the system was available immediately then it will be held here.
+    Immediate(BoxedSystem),
+    /// If the system is not immediately available because it is currently being
+    /// called, then this lets the user
+    Deferred(Arc<Mutex<Option<BoxedSystem<BoxedSystem>>>>),
+}
+
+impl SystemRemoval {
+    /// Try to take the removed system immediately while providing a callback
+    /// that will be used if the system is not immediately available.
+    pub fn take_or_else<M>(self, receiver: impl IntoSystem<BoxedSystem, (), M>) -> Option<BoxedSystem> {
+        match self {
+            Self::Immediate(system) => Some(system),
+            Self::Deferred(deferred) => {
+                let mut deferred_guard = match deferred.lock() {
+                    Ok(guard) => guard,
+                    Err(err) => err.into_inner(),
+                };
+                *deferred_guard = Some(Box::new(IntoSystem::into_system(receiver)));
+                None
+            }
+        }
+    }
+
+    /// Try to take the removed system immediately. If the removal had to be
+    /// deferred then you will receive `None`.
+    pub fn take(self) -> Option<BoxedSystem> {
+        match self {
+            Self::Immediate(system) => Some(system),
+            Self::Deferred(_) => None,
+        }
+    }
 }
 
 /// An identifier for a system registered in the [`SystemRegistry`].
@@ -105,43 +157,144 @@ impl SystemRegistry {
         self.last_id = id;
         let registered_system = RegisteredSystem {
             initialized: false,
-            system: Box::new(IntoSystem::into_system(system)),
+            system: Some(Box::new(IntoSystem::into_system(system))),
+            recursive_calls: 0,
+            removed: None,
         };
         self.systems.insert(id, registered_system);
         SystemId(id)
     }
 
-    /// Removes a registered system from the [`SystemRegistry`], if the [`SystemId`] is not
-    /// registered, it returns [`None`], otherwise it returns the system.
+    /// Removes a registered system from the [`SystemRegistry`]. If the system
+    /// is currently being called then it will finish processing all prior
+    /// run commands for this system. However, new run commands to this `id`
+    /// that are triggered after `remove` has been called will be treated as
+    /// though they are asking for an unknown system.
     #[inline]
-    pub fn remove(&mut self, id: SystemId) -> Option<RegisteredSystem> {
-        self.systems.remove(&id.0)
+    pub fn remove(&mut self, id: SystemId) -> Result<SystemRemoval, SystemRegistryError> {
+        let system = match self.systems.get_mut(&id.0) {
+            Some(entry) => {
+                if entry.removed.is_some() {
+                    // If the system was previously removed then we treat this
+                    // as an error. This can only happen with recursive calls.
+                    return Err(SystemRegistryError::SystemIdNotRegistered(id));
+                }
+                if let Some(system) = entry.system.take() {
+                    // The system is available to be removed so we remove it
+                    // immediately.
+                    system
+                } else {
+                    // The system is currently being called so we cannot immediately
+                    // remove it. We will mark the system as removed and give the
+                    // user an opportunity to handle the removal once the recursion
+                    // is finished.
+                    let receiver = Arc::new(Mutex::new(None));
+                    entry.removed = Some(receiver.clone());
+                    return Ok(SystemRemoval::Deferred(receiver));
+                }
+            }
+            None => {
+                return Err(SystemRegistryError::SystemIdNotRegistered(id));
+            }
+        };
+
+        self.systems.remove(&id.0);
+        return Ok(SystemRemoval::Immediate(system));
     }
 
-    /// Run the system by its [`SystemId`].
+    /// Obtain the system by its [`SystemId`]. This is only for internal use
+    /// because we need to guarantee that the system is given back once it is no
+    /// longer being used. To call the system yourself you can use [`World::run_system_by_id`]
+    /// or [`RunSystemById`] with [`Commands`](crate::system::Commands).
     ///
     /// A [`SystemId`] can be obtained by registering it first via [`SystemRegistry::register`].
     #[inline]
-    pub fn run_by_id(
+    fn take_by_id(
         &mut self,
         world: &mut World,
         id: SystemId,
-    ) -> Result<(), SystemRegistryError> {
+    ) -> Result<Option<BoxedSystem>, SystemRegistryError> {
         match self.systems.get_mut(&id.0) {
             Some(RegisteredSystem {
                 initialized,
                 system,
+                recursive_calls,
+                removed,
             }) => {
+                if removed.is_some() {
+                    // If the user is still asking for the system to be run
+                    // after they have asked for it to be removed, we should
+                    // treat that as an error in their application. This will
+                    // only happen if the system gets removed and then called
+                    // again during a recursive call.
+                    return Err(SystemRegistryError::SystemIdNotRegistered(id));
+                }
+
                 if !*initialized {
-                    system.initialize(world);
+                    // INVARIANT: The `system` field can only be None if the system
+                    // is currently being called. If the `system` is currently
+                    // being called then it would have been initialized before it
+                    // was called and therefore `initialized` cannot be false.
+                    system.as_mut().unwrap().initialize(world);
                     *initialized = true;
                 }
-                system.run((), world);
-                system.apply_deferred(world);
-                Ok(())
+
+                if let Some(system) = system.take() {
+                    return Ok(Some(system));
+                }
+
+                // The system was not available which means we are being run
+                // recursively. Therefore we will increment the recursive_calls
+                // counter to remember that this system needs to be re-called
+                // later.
+                *recursive_calls += 1;
+                Ok(None)
             }
             None => Err(SystemRegistryError::SystemIdNotRegistered(id)),
         }
+    }
+
+    /// Give the system back to the registry once it no longer needs to be run.
+    /// This must always be called after `take_by_id` so that the system registry
+    /// can continue to work as intended.
+    ///
+    /// If the system was removed from the registry while it was being called,
+    /// this will return Some with both the system and the removal handler. When
+    /// this returns Some, the caller is obligated to run the handler, passing
+    /// it the system that used to be registered.
+    #[must_use]
+    fn restore_by_id(
+        &mut self,
+        id: SystemId,
+        system: BoxedSystem,
+    ) -> Option<(BoxedSystem, Arc<Mutex<Option<BoxedSystem<BoxedSystem>>>>)> {
+        let removed = if let Some(entry) = self.systems.get_mut(&id.0) {
+            if let Some(removed) = entry.removed.take() {
+                // The system was removed while it was being called
+                removed
+            } else {
+                // The system was not removed while it was being called, so
+                // place it back into the registry.
+                entry.system = Some(system);
+                return None;
+            }
+        } else {
+            // This should never actually happen... panic here instead?
+            return None;
+        };
+
+        // Give back the system and its removal handler because this system has
+        // been removed from the registry.
+        self.systems.remove(&id.0);
+        Some((system, removed))
+    }
+
+    /// Get the count for how deeply a system has recursively called itself.
+    /// This is used internally to queue up future calls of the system, equal to
+    /// the number of times it was called recursively.
+    #[inline]
+    fn recursion_count(&mut self, id: SystemId) -> Option<&mut usize> {
+        self.systems.get_mut(&id.0).map(|entry| &mut entry.recursive_calls)
     }
 }
 
@@ -154,26 +307,16 @@ impl World {
         &mut self,
         system: S,
     ) -> SystemId {
-        if !self.contains_resource::<SystemRegistry>() {
-            panic!(
-                "SystemRegistry not found: Nested and recursive one-shot systems are not supported"
-            );
-        }
-
         self.resource_mut::<SystemRegistry>().register(system)
     }
 
-    /// Removes a registered system in the [`SystemRegistry`] and returns the system if it exists.
+    /// Removes a registered system in the [`SystemRegistry`]. To obtain the
+    /// removed system, you will need to use the [`SystemRegistry`] resource
+    /// directly.
     ///
     /// Calls [`SystemRegistry::remove`].
     #[inline]
-    pub fn remove_system(&mut self, id: SystemId) -> Option<RegisteredSystem> {
-        if !self.contains_resource::<SystemRegistry>() {
-            panic!(
-                "SystemRegistry not found: Nested and recursive one-shot systems are not supported"
-            );
-        }
-
+    pub fn remove_system(&mut self, id: SystemId) -> Result<SystemRemoval, SystemRegistryError> {
         self.resource_mut::<SystemRegistry>().remove(id)
     }
 
@@ -183,15 +326,52 @@ impl World {
     /// Calls [`SystemRegistry::run_by_id`].
     #[inline]
     pub fn run_system_by_id(&mut self, id: SystemId) -> Result<(), SystemRegistryError> {
-        if !self.contains_resource::<SystemRegistry>() {
-            panic!(
-                "SystemRegistry not found: Nested and recursive one-shot systems are not supported"
-            );
+        let system = self.resource_scope(|world, mut registry: Mut<SystemRegistry>| {
+            registry.take_by_id(world, id)
+        })?;
+
+        if let Some(mut system) = system {
+            system.run((), self);
+            system.apply_deferred(self);
+
+            let mut last_known_recursion_count: usize = 0;
+            while {
+                let mut registry = self.resource_mut::<SystemRegistry>();
+                let recursion = if let Some(recursion) = registry.recursion_count(id) {
+                    last_known_recursion_count = *recursion;
+                    recursion
+                } else {
+                    // If the system has been removed from the registry then we
+                    // will continue executing it however many times it was
+                    // previously queued up to be called.
+                    &mut last_known_recursion_count
+                };
+
+                if *recursion > 0 {
+                    *recursion -= 1;
+                    true
+                } else {
+                    false
+                }
+            } {
+                system.run((), self);
+                system.apply_deferred(self);
+            }
+
+            if let Some((system, receiver)) = self.resource_mut::<SystemRegistry>().restore_by_id(id, system) {
+                let mut receiver = match receiver.lock() {
+                    Ok(guard) => guard,
+                    Err(guard) => guard.into_inner(),
+                };
+                if let Some(mut receiver) = receiver.take() {
+                    receiver.initialize(self);
+                    receiver.run(system, self);
+                    receiver.apply_deferred(self);
+                }
+            }
         }
 
-        self.resource_scope(|world, mut registry: Mut<SystemRegistry>| {
-            registry.run_by_id(world, id)
-        })
+        Ok(())
     }
 }
 
@@ -211,19 +391,10 @@ impl RunSystemById {
 impl Command for RunSystemById {
     #[inline]
     fn apply(self, world: &mut World) {
-        if !world.contains_resource::<SystemRegistry>() {
-            panic!(
-                "SystemRegistry not found: Nested and recursive one-shot systems are not supported"
-            );
-        }
-
-        world.resource_scope(|world, mut registry: Mut<SystemRegistry>| {
-            registry
-                .run_by_id(world, self.system_id)
-                // Ideally this error should be handled more gracefully,
-                // but that's blocked on a full error handling solution for commands
-                .unwrap();
-        });
+        world.run_system_by_id(self.system_id)
+            // Ideally this error should be handled more gracefully,
+            // but that's blocked on a full error handling solution for commands
+            .unwrap()
     }
 }
 
@@ -238,10 +409,22 @@ pub enum SystemRegistryError {
 
 mod tests {
     use crate as bevy_ecs;
-    use crate::prelude::*;
+    use crate::{prelude::*, system::{SystemId, SystemRegistry, BoxedSystem}};
 
     #[derive(Resource, Default, PartialEq, Debug)]
     struct Counter(u8);
+
+    #[derive(Resource)]
+    struct TestSystemId(SystemId);
+
+    #[derive(Resource)]
+    struct SiblingSystemId(SystemId);
+
+    #[derive(Resource)]
+    struct DeferredRemovalFlag;
+
+    #[derive(Resource)]
+    struct ImmediateRemovalFlag;
 
     #[test]
     fn change_detection() {
@@ -294,5 +477,145 @@ mod tests {
         assert_eq!(*world.resource::<Counter>(), Counter(4));
         let _ = world.run_system_by_id(id);
         assert_eq!(*world.resource::<Counter>(), Counter(8));
+    }
+
+    #[test]
+    fn registered_system_recursion() {
+        let mut world = World::new();
+        let registered_system = world.register_system(|
+            Local(local_counter): Local<u8>,
+            test_system: Res<TestSystemId>,
+            mut global_counter: ResMut<Counter>,
+            mut commands: Commands,
+        | {
+            if *local_counter < 10 {
+                *local_counter += 1;
+                commands.run_system_by_id(test_system.0);
+            }
+
+            global_counter.0 += 1;
+            assert!(global_counter.0 <= 11);
+        });
+
+        world.insert_resource(Counter(0));
+        world.insert_resource(TestSystemId(registered_system));
+
+        // Triggering the registered system once should bring the global counter
+        // all the way up to 10.
+        world.run_system_by_id(registered_system).unwrap();
+        assert_eq!(world.resource::<Counter>().0, 11);
+    }
+
+    #[test]
+    fn self_removal() {
+        let mut world = World::new();
+        let self_removing_system = world.register_system(|
+            Local(local_counter): Local<u8>,
+            test_system: Res<TestSystemId>,
+            mut global_counter: ResMut<Counter>,
+            mut commands: Commands,
+            mut registry: ResMut<SystemRegistry>,
+        | {
+            global_counter.0 += 1;
+            if *local_counter < 3 {
+                *local_counter += 1;
+                // Call this twice to make the recursion more complex
+                commands.run_system_by_id(test_system.0);
+                commands.run_system_by_id(test_system.0);
+            } else {
+                if let Ok(removal) = registry.remove(test_system.0) {
+                    if let Some(_) = removal.take_or_else(
+                        |_: In<BoxedSystem>, mut commands: Commands| {
+                            commands.insert_resource(DeferredRemovalFlag);
+                        })
+                    {
+                        panic!("The system should not have been immediately available");
+                    }
+                }
+            }
+        });
+
+        world.insert_resource(Counter(0));
+        world.insert_resource(TestSystemId(self_removing_system));
+
+        // One call to the registered system should have it call itself multiple
+        // times and then remove itself.
+        world.run_system_by_id(self_removing_system).unwrap();
+
+        assert!(world.get_resource::<DeferredRemovalFlag>().is_some());
+
+        // We expect 7 calls because:
+        // - We trigger one call at the start
+        // - The first call triggers two more
+        // - On the second call `local_counter` is 1 so it triggers two more
+        // - On the third call `local_counter` is 2 so it triggers two more
+        // - No more new calls should be triggered at this point because `local_counter` is 3.
+        // We expect all triggered calls (7) to be processed and counted.
+        assert_eq!(world.resource::<Counter>().0, 7);
+    }
+
+    #[test]
+    fn sibling_removal() {
+        let mut world = World::new();
+        let test_system = world.register_system(|| {});
+        let removal_system = world.register_system(|
+            mut registry: ResMut<SystemRegistry>,
+            test_system: Res<TestSystemId>,
+            mut commands: Commands,
+        | {
+            if let Some(_) = registry.remove(test_system.0).unwrap().take_or_else(
+                |_: In<BoxedSystem>, mut commands: Commands| {
+                    commands.insert_resource(DeferredRemovalFlag);
+                })
+            {
+                commands.insert_resource(ImmediateRemovalFlag);
+            }
+        });
+
+        world.insert_resource(TestSystemId(test_system));
+        world.run_system_by_id(removal_system).unwrap();
+
+        assert!(world.get_resource::<ImmediateRemovalFlag>().is_some());
+        assert!(world.get_resource::<DeferredRemovalFlag>().is_none());
+    }
+
+    #[test]
+    fn sibling_run() {
+        let mut world = World::new();
+        let test_system = world.register_system(|
+            Local(local_counter): Local<u8>,
+            sibling_system: Res<SiblingSystemId>,
+            mut commands: Commands,
+            mut global_counter: ResMut<Counter>,
+        | {
+            global_counter.0 += 1;
+            if *local_counter < 3 {
+                *local_counter += 1;
+                commands.run_system_by_id(sibling_system.0);
+                commands.run_system_by_id(sibling_system.0);
+            }
+        });
+        let sibling_system = world.register_system(|
+            Local(local_counter): Local<u8>,
+            test_system: Res<TestSystemId>,
+            mut commands: Commands,
+            mut global_counter: ResMut<Counter>,
+        | {
+            global_counter.0 += 1;
+            if *local_counter < 3 {
+                *local_counter += 1;
+                commands.run_system_by_id(test_system.0);
+                commands.run_system_by_id(test_system.0);
+            }
+        });
+
+        world.insert_resource(Counter(0));
+        world.insert_resource(TestSystemId(test_system));
+        world.insert_resource(SiblingSystemId(sibling_system));
+
+        world.run_system_by_id(test_system).unwrap();
+        // Each system should trigger its siblings 2 x 3 = 12 times. Add one
+        // more for the initial trigger to get 13.
+        assert_eq!(world.resource::<Counter>().0, 13);
     }
 }
